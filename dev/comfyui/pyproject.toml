@@ -9,10 +9,15 @@ dependencies = [
     "librosa>=0.10.2",
     "transformers>=4.52.0",
 ]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 
 [project.urls]
 Repository = "https://github.com/kandinskylab/kandinsky-s2v"
 Documentation = "https://github.com/kandinskylab/kandinsky-s2v/tree/main/dev/comfyui"
+"Bug Tracker" = "https://github.com/kandinskylab/kandinsky-s2v/issues"
 
 [tool.comfy]
 PublisherId = "kandinskylab"
