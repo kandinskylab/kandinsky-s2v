@@ -50,6 +50,22 @@ parity:
 parity-pipeline *ARGS:
     @TORCHDYNAMO_DISABLE=1 uv run python dev/bench/s2v_parity_pipeline.py {{ARGS}}
 
+# The ComfyUI extension (dev/comfyui) runs in ComfyUI's Python, not this venv.
+# COMFYUI=/path/to/ComfyUI selects the checkout; PYTHON its interpreter.
+# just comfy-test
+comfy-test *ARGS:
+    @cd dev/comfyui && ${PYTHON:-python} -m pytest -c tests/pytest.ini tests {{ARGS}}
+
+# GPU parity of the ComfyUI nodes against this repo's pipeline, Lite or Pro distilled.
+# Weights are read from $COMFYUI/models; DIT=/path/to/model.safetensors overrides the forward's.
+# just comfy-parity-forward [--model pro] [--dynamic]
+# just comfy-parity-pipeline [--model pro] --audio speech.wav --image reference.png
+comfy-parity-forward *ARGS:
+    @${PYTHON:-python} dev/comfyui/dev/parity_forward.py {{ARGS}}
+
+comfy-parity-pipeline *ARGS:
+    @${PYTHON:-python} dev/comfyui/dev/parity_pipeline.py {{ARGS}}
+
 # Remove generated Python, test and lint artifacts. Keeps the venv and outputs.
 clean:
     #!/usr/bin/env bash

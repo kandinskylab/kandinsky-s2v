@@ -190,6 +190,11 @@ encode_video(
 )
 ```
 
+## ComfyUI
+
+Lite distilled and Pro distilled can also be run in ComfyUI: see
+[dev/comfyui](dev/comfyui/README.md).
+
 ## Responsible use
 
 The model animates a real person from a single photograph, driven by a

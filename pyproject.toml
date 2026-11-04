@@ -66,8 +66,9 @@ include = [
 line-length = 120
 target-version = "py313"
 # Diffusers' own tests for the port, kept in Diffusers form (relative imports into
-# its test suite, its line length) and linted there once injected.
-extend-exclude = ["dev/diffusers_tests"]
+# its test suite, its line length) and linted there once injected. The ComfyUI
+# extension is a package of its own: Python 3.10, ComfyUI's naming (INPUT_TYPES).
+extend-exclude = ["dev/diffusers_tests", "dev/comfyui"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "PL", "B", "ERA", "SIM"]
