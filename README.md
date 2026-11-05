@@ -10,6 +10,7 @@
 
 <p>
   <a href="https://kandinskyavatar.github.io"><img src="https://img.shields.io/badge/Project-Page-green" alt="Project Page"></a>
+  <a href="https://arxiv.org/pdf/2610.19290"><img src="https://img.shields.io/badge/Technical-Report-red" alt="Technical Report"></a>
   <a href="https://huggingface.co/collections/kandinskylab/kandinsky-s2v-10-6ab65ebe8f765b6dd9d706d7"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue" alt="Hugging Face"></a>
   <a href="https://huggingface.co/spaces/kandinskylab/Kandinsky-S2V-1.0-Demo"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-yellow" alt="Demo"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License"></a>

@@ -122,6 +122,7 @@ def badge(label: str, value: str, color: str, url: str) -> str:
 BADGES = "".join(
     (
         badge("Project", "Page", "#4c1", "https://kandinskyavatar.github.io"),
+        badge("Technical", "Report", "#e05d44", "https://arxiv.org/pdf/2610.19290"),
         badge(
             "🤗 Hugging Face",
             "Models",
