@@ -13,30 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
-import struct
-import tempfile
-import wave
-from pathlib import Path
 
 import pytest
 import torch
 from PIL import Image
 
-from diffusers import ClassifierFreeGuidance, ModularPipeline
 from diffusers.modular_pipelines import (
     KandinskyS2VAutoBlocks,
     KandinskyS2VDistilledAutoBlocks,
     KandinskyS2VDistilledModularPipeline,
     KandinskyS2VModularPipeline,
 )
+from diffusers.modular_pipelines.kandinsky_s2v.encoders import KandinskyS2VTextAudioEncoderStep
+from diffusers.modular_pipelines.kandinsky_s2v.modular_pipeline import DEFAULT_PROMPT
 
+from ...testing_utils import numpy_cosine_similarity_distance, require_accelerator, torch_device
 from ..testing_utils import (
     BaseModularPipelineTesterConfig,
+    ModularGuiderTesterMixin,
     ModularLoadingTesterMixin,
     ModularMemoryTesterMixin,
     ModularPipelineTesterMixin,
+    ModularWorkflowTesterMixin,
 )
 
 
@@ -49,18 +48,22 @@ AUDIO_SAMPLE_RATE = 16000
 NUM_LATENT_FRAMES = 8
 
 
-@functools.lru_cache(maxsize=1)
-def dummy_audio() -> str:
-    """A second of a plain tone; the speech is read from a file, not a tensor."""
-    path = Path(tempfile.mkdtemp()) / "speech.wav"
-    with wave.open(str(path), "w") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(AUDIO_SAMPLE_RATE)
-        handle.writeframes(
-            b"".join(struct.pack("<h", int(8000 * math.sin(i / 24))) for i in range(AUDIO_SAMPLE_RATE))
-        )
-    return str(path)
+def dummy_waveform(seconds: int = 1) -> torch.Tensor:
+    """A plain tone, as a mono waveform at 16 kHz."""
+    return 0.25 * torch.sin(torch.arange(seconds * AUDIO_SAMPLE_RATE) / 24)
+
+
+def check_float16_inference(tester, expected_max_diff=5e-2):
+    """The mixin's fp16 check, with the pipeline loaded in fp16 rather than cast to it after loading.
+
+    Loading in a dtype keeps `_keep_in_fp32_modules` in fp32; `.to(torch.float16)` would cast them too.
+    """
+    outputs = []
+    for dtype in (torch.float32, torch.float16):
+        pipe = tester.get_pipeline(dtype=dtype).to(torch_device)
+        outputs.append(pipe(**tester.get_dummy_inputs(), output=tester.output_name).float().cpu())
+    max_diff = numpy_cosine_similarity_distance(outputs[0].flatten().numpy(), outputs[1].flatten().numpy())
+    assert max_diff < expected_max_diff, f"FP16 inference is different from FP32 inference (max_diff: {max_diff})"
 
 
 class KandinskyS2VModularPipelineTesterConfig(BaseModularPipelineTesterConfig):
@@ -71,11 +74,45 @@ class KandinskyS2VModularPipelineTesterConfig(BaseModularPipelineTesterConfig):
     batch_params = frozenset(["prompt"])
     optional_params = frozenset(["num_inference_steps", "output_type"])
     output_name = "videos"
+    latents_output_name = "latent_chunks"
+    # One chunk, channels last: (num_latent_frames, latent_height, latent_width, channels).
+    expected_latents_shape = (NUM_LATENT_FRAMES, 8, 8, 4)
+    expected_workflow_defaults = {
+        None: {
+            "components": {
+                "text_encoder": "Qwen2_5OmniThinkerForConditionalGeneration",
+                "tokenizer": "Qwen2_5OmniProcessor",
+                "text_encoder_2": "CLIPTextModel",
+                "tokenizer_2": "CLIPTokenizer",
+                "vae": "AutoencoderKLHunyuanVideo",
+                "video_processor": "VideoProcessor",
+                "transformer": "KandinskyS2VTransformer3DModel",
+                "scheduler": "FlowMatchEulerDiscreteScheduler",
+                "guider": "ClassifierFreeGuidance",
+            },
+            # The speech track drives the video; the prompt defaults to the one the checkpoints were trained with.
+            "required_inputs": ["image", "audio"],
+            "inputs": {
+                "prompt": DEFAULT_PROMPT,
+                "negative_prompt": None,
+                "num_latent_frames": 32,
+                "fps": 25,
+                "num_chunks": None,
+                "height": None,
+                "width": None,
+                "generator": None,
+                "num_inference_steps": 50,
+                "scale_factor": (1.0, 2.0, 2.0),
+                "output_type": "pil",
+            },
+            "component_configs": {"video_processor": {"vae_scale_factor": 8}, "guider": {"guidance_scale": 3.0}},
+        },
+    }
 
     def get_dummy_inputs(self, seed=0):
         return {
             "image": Image.new("RGB", (64, 64), color="red"),
-            "audio": dummy_audio(),
+            "audio": dummy_waveform(),
             # Short prompts: the tiny transformer's text RoPE table is shorter than the default prompt.
             "prompt": "a person speaking",
             "negative_prompt": "static, motionless",
@@ -101,18 +138,18 @@ class TestKandinskyS2VModularPipelineFast(KandinskyS2VModularPipelineTesterConfi
     def test_num_images_per_prompt(self):
         pass
 
-    @pytest.mark.skip(reason="The normalisations do their arithmetic in fp32, which casting the whole model bypasses")
+    @require_accelerator
     def test_float16_inference(self):
-        pass
+        check_float16_inference(self)
 
     def test_two_chunks_carry_memory(self):
         """Two chunks end to end: the second is conditioned on the FramePack memory rolled from the first."""
         pipe = self.get_pipeline()
         inputs = self.get_dummy_inputs()
         inputs["num_chunks"] = 2
-        latents = pipe(**{**inputs, "output_type": "latent"}, output="videos")
-        assert latents.shape[1] == 2 * NUM_LATENT_FRAMES
-        assert torch.isfinite(latents).all()
+        latent_chunks = pipe(**inputs, output="latent_chunks")
+        assert len(latent_chunks) == 2
+        assert all(chunk.shape[0] == NUM_LATENT_FRAMES and torch.isfinite(chunk).all() for chunk in latent_chunks)
 
     def test_rejects_speech_past_the_encoder_limit(self):
         pipe = self.get_pipeline()
@@ -124,8 +161,45 @@ class TestKandinskyS2VModularPipelineFast(KandinskyS2VModularPipelineTesterConfi
         with pytest.raises(ValueError, match="truncates"):
             pipe(**inputs, output="videos")
 
+    def test_track_longer_than_the_chunks(self):
+        """The speech is cut to the chunks: a 2 s track in one 1.16 s chunk."""
+        pipe = self.get_pipeline()
+        inputs = {**self.get_dummy_inputs(), "audio": dummy_waveform(seconds=2), "num_chunks": 1}
+        latent_chunks = pipe(**inputs, output="latent_chunks")
+        assert len(latent_chunks) == 1 and latent_chunks[0].shape[0] == NUM_LATENT_FRAMES
+
+    def test_text_encoder_standalone_encodes_negative_prompt_only_when_passed(self):
+        """Standalone, the text encoder has no guider: a negative prompt is encoded only when it is passed."""
+        text_pipe = KandinskyS2VTextAudioEncoderStep().init_pipeline(self.pretrained_model_name_or_path)
+        text_pipe.load_components()
+        inputs = {"prompt": "a person speaking", "audio": dummy_waveform(), "num_latent_frames": NUM_LATENT_FRAMES}
+        assert text_pipe(**inputs, output="negative_prompt_embeds") is None
+        assert text_pipe(**inputs, negative_prompt="static", output="negative_prompt_embeds") is not None
+
+    @pytest.mark.parametrize(
+        "waveform",
+        [
+            dummy_waveform().expand(2, -1),
+            torch.zeros(0),
+            (dummy_waveform() * 32768).to(torch.int16),
+        ],
+        ids=["multichannel", "empty", "int16"],
+    )
+    def test_rejects_a_bad_waveform(self, waveform):
+        pipe = self.get_pipeline()
+        with pytest.raises(ValueError, match="mono float waveform"):
+            pipe(**{**self.get_dummy_inputs(), "audio": waveform}, output="videos")
+
 
 class TestKandinskyS2VModularPipelineLoading(KandinskyS2VModularPipelineTesterConfig, ModularLoadingTesterMixin):
+    pass
+
+
+class TestKandinskyS2VModularPipelineGuider(KandinskyS2VModularPipelineTesterConfig, ModularGuiderTesterMixin):
+    pass
+
+
+class TestKandinskyS2VModularPipelineWorkflow(KandinskyS2VModularPipelineTesterConfig, ModularWorkflowTesterMixin):
     pass
 
 
@@ -137,16 +211,48 @@ FAST_SKIPS = {
     "test_inference_batch_consistent": "The pipeline takes one prompt at a time; batching is not supported",
     "test_inference_batch_single_identical": "The pipeline takes one prompt at a time; batching is not supported",
     "test_num_images_per_prompt": "One video per call; there is no num_images_per_prompt",
-    "test_float16_inference": "The normalisations do their arithmetic in fp32, which casting the whole model bypasses",
 }
 
 
 class KandinskyS2VDistilledModularPipelineTesterConfig(KandinskyS2VModularPipelineTesterConfig):
-    """The pi-Flow checkpoints: a head widened to its grid, `KandinskyS2VPiflowScheduler`, guidance off."""
+    """The pi-Flow checkpoints: a head widened to its grid, `PiflowScheduler`, guidance off."""
 
     pipeline_class = KandinskyS2VDistilledModularPipeline
     pipeline_blocks_class = KandinskyS2VDistilledAutoBlocks
     pretrained_model_name_or_path = TINY_DISTILLED_REPO
+    expected_workflow_defaults = {
+        None: {
+            "components": {
+                "text_encoder": "Qwen2_5OmniThinkerForConditionalGeneration",
+                "tokenizer": "Qwen2_5OmniProcessor",
+                "text_encoder_2": "CLIPTextModel",
+                "tokenizer_2": "CLIPTokenizer",
+                "vae": "AutoencoderKLHunyuanVideo",
+                "video_processor": "VideoProcessor",
+                "transformer": "KandinskyS2VTransformer3DModel",
+                "scheduler": "PiflowScheduler",
+            },
+            "required_inputs": ["image", "audio"],
+            "inputs": {
+                "prompt": DEFAULT_PROMPT,
+                "num_latent_frames": 32,
+                "fps": 25,
+                "num_chunks": None,
+                "height": None,
+                "width": None,
+                "generator": None,
+                "num_inference_steps": 16,
+                "scale_factor": (1.0, 2.0, 2.0),
+                "output_type": "pil",
+            },
+            "component_configs": {"video_processor": {"vae_scale_factor": 8}},
+        },
+    }
+
+    def get_dummy_inputs(self, seed=0):
+        inputs = super().get_dummy_inputs(seed)
+        inputs.pop("negative_prompt")
+        return inputs
 
 
 class TestKandinskyS2VDistilledModularPipelineFast(
@@ -164,19 +270,9 @@ class TestKandinskyS2VDistilledModularPipelineFast(
     def test_num_images_per_prompt(self):
         pass
 
-    @pytest.mark.skip(reason=FAST_SKIPS["test_float16_inference"])
+    @require_accelerator
     def test_float16_inference(self):
-        pass
-
-    def test_guidance_is_off(self):
-        assert self.get_pipeline().guider.guidance_scale == 1.0
-
-    def test_rejects_guidance(self):
-        """Guidance on top of the student would over-guide it, quietly and at twice the cost."""
-        pipe = self.get_pipeline()
-        pipe.update_components(guider=ClassifierFreeGuidance(guidance_scale=4.0))
-        with pytest.raises(ValueError, match="distilled into the student"):
-            pipe(**self.get_dummy_inputs(), output="videos")
+        check_float16_inference(self)
 
 
 class TestKandinskyS2VDistilledModularPipelineLoading(
@@ -185,21 +281,13 @@ class TestKandinskyS2VDistilledModularPipelineLoading(
     pass
 
 
-class TestKandinskyS2VDistilledModularPipelineMemory(
-    KandinskyS2VDistilledModularPipelineTesterConfig, ModularMemoryTesterMixin
+class TestKandinskyS2VDistilledModularPipelineWorkflow(
+    KandinskyS2VDistilledModularPipelineTesterConfig, ModularWorkflowTesterMixin
 ):
     pass
 
 
-@pytest.mark.parametrize(
-    ("repo", "pipeline_class", "blocks_class"),
-    [
-        (TINY_REPO, KandinskyS2VModularPipeline, KandinskyS2VAutoBlocks),
-        (TINY_DISTILLED_REPO, KandinskyS2VDistilledModularPipeline, KandinskyS2VDistilledAutoBlocks),
-    ],
-)
-def test_from_pretrained_picks_the_variant(repo, pipeline_class, blocks_class):
-    """What a user does: the checkpoint alone decides the pipeline and blocks, base or distilled."""
-    pipe = ModularPipeline.from_pretrained(repo)
-    assert type(pipe) is pipeline_class
-    assert type(pipe.blocks) is blocks_class
+class TestKandinskyS2VDistilledModularPipelineMemory(
+    KandinskyS2VDistilledModularPipelineTesterConfig, ModularMemoryTesterMixin
+):
+    pass

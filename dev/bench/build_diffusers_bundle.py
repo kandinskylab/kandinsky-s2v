@@ -34,7 +34,7 @@ import yaml
 from kandinsky_s2v.pipeline.weights import resolve
 
 TRANSFORMER_CLASS = "KandinskyS2VTransformer3DModel"
-PISCHEDULER_CLASS = "KandinskyS2VPiflowScheduler"
+PISCHEDULER_CLASS = "PiflowScheduler"
 
 
 def components(distilled: bool) -> dict[str, tuple[str, str]]:

@@ -82,7 +82,11 @@ ignore = ["PLR0917"]
 # Parts of the port mirror Diffusers' Kandinsky 6 transformer as written there.
 # Diffusers lints with its own configuration, so the rules it does not enforce
 # cannot be enforced here either.
-"src/kandinsky_s2v/ports/diffusers/*.py" = ["E501", "PLR2004"]
+"src/kandinsky_s2v/ports/diffusers/*.py" = ["E501", "N812", "PLR0913", "PLR0915", "PLR2004"]
+# A verbatim copy of Diffusers' PiflowScheduler, which the S2V pull request also fixes.
+"src/kandinsky_s2v/ports/diffusers/scheduling_piflow.py" = ["E501", "PLR2004", "PLR0913", "SIM101"]
+# Diffusers asks for helpers with explicit arguments over passing `components` / `block_state`.
+"src/kandinsky_s2v/ports/diffusers/modular/*.py" = ["PLR0913"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

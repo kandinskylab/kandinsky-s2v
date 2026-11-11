@@ -26,8 +26,10 @@ import argparse
 import time
 from pathlib import Path
 
+import librosa
 import torch
 from diffusers import ComponentsManager, ModularPipeline
+from diffusers.utils import load_image
 
 FPS = 25
 
@@ -75,7 +77,12 @@ def main() -> None:
     print(f"[gen] imported from {type(pipe).__module__}", flush=True)
 
     started = time.time()
-    inputs = {"image": args.image, "audio": args.audio, "num_chunks": args.chunks, "output_type": "np"}
+    inputs = {
+        "image": load_image(args.image),
+        "audio": librosa.load(args.audio, sr=16000)[0],
+        "num_chunks": args.chunks,
+        "output_type": "np",
+    }
     if args.steps is not None:
         inputs["num_inference_steps"] = args.steps
     frames = pipe(**inputs, output="videos")[0]

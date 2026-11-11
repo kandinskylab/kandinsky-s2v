@@ -6,7 +6,7 @@ them with `blocks.init_pipeline(repo).load_components()` and
 real checkpoints — a `modular_model_index.json` naming the pipeline and blocks,
 and a folder per component. One repository per variant, as for the real ones:
 the base setup, and with `--distilled` the pi-Flow one (the head widened to its
-grid, `KandinskyS2VPiflowScheduler`, the distilled blocks).
+grid, `PiflowScheduler`, the distilled blocks).
 
     PYTHONPATH=src .venv/bin/python dev/bench/build_tiny_modular_repo.py \\
         --out /tmp/tiny-kandinsky-s2v-modular-pipe --repo-id kandinskylab/tiny-kandinsky-s2v-modular-pipe
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-from kandinsky_s2v.ports.diffusers import KandinskyS2VPiflowScheduler, KandinskyS2VTransformer3DModel
+from kandinsky_s2v.ports.diffusers import KandinskyS2VTransformer3DModel, PiflowScheduler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_diffusers_bundle import write_modular_index  # noqa: E402
@@ -101,9 +101,7 @@ def tiny_components(distilled: bool) -> dict:
         text_rope_max_pos=128,
     )
     scheduler = (
-        KandinskyS2VPiflowScheduler(shift=7.0, n_grid=TINY_GRID)
-        if distilled
-        else FlowMatchEulerDiscreteScheduler(shift=7.0)
+        PiflowScheduler(shift=7.0, n_grid=TINY_GRID) if distilled else FlowMatchEulerDiscreteScheduler(shift=7.0)
     )
     return {
         "vae": vae,

@@ -106,14 +106,32 @@ class KandinskyS2VPrepareStep(ModularPipelineBlocks):
     @property
     def inputs(self) -> list[InputParam]:
         return [
-            InputParam("reference_latents", required=True, type_hint=torch.Tensor),
-            InputParam("audio_embeds", required=True, type_hint=torch.Tensor),
-            InputParam("num_chunks", required=True, type_hint=int),
-            InputParam("num_latent_frames", default=32, type_hint=int),
+            InputParam(
+                "reference_latents",
+                required=True,
+                type_hint=torch.Tensor,
+                description="Scaled VAE latent of the reference frame, from the VAE encoder step.",
+            ),
+            InputParam(
+                "audio_embeds",
+                required=True,
+                type_hint=torch.Tensor,
+                description="Audio-tower features of the speech track, from the text encoder step.",
+            ),
+            InputParam("num_chunks", required=True, type_hint=int, description="Number of chunks to generate."),
+            InputParam(
+                "num_latent_frames",
+                default=32,
+                type_hint=int,
+                description="Latent frames per chunk; 32 gives 125 frames (5 s at 25 fps).",
+            ),
             InputParam.template("prompt_embeds", required=True),
-            InputParam.template("negative_prompt_embeds"),
-            InputParam("pooled_prompt_embeds", required=True, type_hint=torch.Tensor),
-            InputParam("negative_pooled_prompt_embeds", type_hint=torch.Tensor),
+            InputParam(
+                "pooled_prompt_embeds",
+                required=True,
+                type_hint=torch.Tensor,
+                description="CLIP pooled prompt embedding.",
+            ),
         ]
 
     @property
@@ -126,21 +144,29 @@ class KandinskyS2VPrepareStep(ModularPipelineBlocks):
             OutputParam("latent_width", type_hint=int, description="Width of the latents."),
             OutputParam("audio_chunks", type_hint=list, description="Speech features of each chunk."),
             OutputParam.template("prompt_embeds"),
-            OutputParam.template("negative_prompt_embeds"),
-            OutputParam("pooled_prompt_embeds", type_hint=torch.Tensor),
-            OutputParam("negative_pooled_prompt_embeds", type_hint=torch.Tensor),
-            OutputParam("text_rope_pos", type_hint=torch.Tensor),
-            OutputParam("negative_text_rope_pos", type_hint=torch.Tensor),
-            OutputParam("visual_rope_pos", type_hint=list),
-            OutputParam("reference_rope_pos", type_hint=list),
+            OutputParam("pooled_prompt_embeds", type_hint=torch.Tensor, description="CLIP pooled prompt embedding."),
+            OutputParam("text_rope_pos", type_hint=torch.Tensor, description="RoPE positions of the prompt tokens."),
+            OutputParam("visual_rope_pos", type_hint=list, description="Per-axis RoPE positions of a chunk."),
+            OutputParam(
+                "reference_rope_pos", type_hint=list, description="Per-axis RoPE positions of the reference frame."
+            ),
             OutputParam("memory", type_hint=list, description="FramePack memory in [1x, 2x, 4x] order."),
         ]
+
+    @staticmethod
+    def check_inputs(num_latent_frames: int, frame_buckets: list[int]):
+        if num_latent_frames < sum(frame_buckets):
+            raise ValueError(
+                f"`num_latent_frames` must be >= {sum(frame_buckets)}, the FramePack memory window "
+                f"sum(frame_buckets), got {num_latent_frames}"
+            )
 
     @torch.no_grad()
     def __call__(self, components: KandinskyS2VModularPipeline, state: PipelineState) -> PipelineState:
         block_state = self.get_block_state(state)
-        device = components._execution_device
         config = components.transformer.config
+        self.check_inputs(block_state.num_latent_frames, config.frame_buckets)
+        device = components._execution_device
         dtype = components.transformer.dtype
         patch_size = config.patch_size
 
@@ -152,13 +178,6 @@ class KandinskyS2VPrepareStep(ModularPipelineBlocks):
         block_state.prompt_embeds = block_state.prompt_embeds.to(dtype)
         block_state.pooled_prompt_embeds = block_state.pooled_prompt_embeds.to(dtype)
         block_state.text_rope_pos = torch.arange(block_state.prompt_embeds.shape[0], device=device)
-        block_state.negative_text_rope_pos = None
-        if block_state.negative_prompt_embeds is not None:
-            block_state.negative_prompt_embeds = block_state.negative_prompt_embeds.to(dtype)
-            block_state.negative_pooled_prompt_embeds = block_state.negative_pooled_prompt_embeds.to(dtype)
-            block_state.negative_text_rope_pos = torch.arange(
-                block_state.negative_prompt_embeds.shape[0], device=device
-            )
 
         block_state.audio_chunks = split_audio_embeds(block_state.audio_embeds.to(dtype), block_state.num_chunks)
 
@@ -175,6 +194,70 @@ class KandinskyS2VPrepareStep(ModularPipelineBlocks):
         ]
         # Latents and memory stay fp32; only the forward runs in the transformer's dtype.
         block_state.memory = init_memory(config, height, width, torch.float32, device)
+
+        self.set_block_state(state, block_state)
+        return components, state
+
+
+class KandinskyS2VPrepareNegativeStep(ModularPipelineBlocks):
+    model_name = "kandinsky-s2v"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Prepare step for the unconditional pass of the guidance: casts the negative prompt embeddings to the "
+            "transformer's dtype and builds their RoPE positions. Without a negative prompt it passes nothing on."
+        )
+
+    @property
+    def expected_components(self) -> list[ComponentSpec]:
+        return [ComponentSpec("transformer", KandinskyS2VTransformer3DModel)]
+
+    @property
+    def inputs(self) -> list[InputParam]:
+        return [
+            InputParam.template("negative_prompt_embeds"),
+            InputParam(
+                "negative_pooled_prompt_embeds",
+                type_hint=torch.Tensor,
+                description="CLIP pooled negative prompt embedding.",
+            ),
+        ]
+
+    @property
+    def intermediate_outputs(self) -> list[OutputParam]:
+        return [
+            OutputParam.template("negative_prompt_embeds"),
+            OutputParam(
+                "negative_pooled_prompt_embeds",
+                type_hint=torch.Tensor,
+                description="CLIP pooled negative prompt embedding.",
+            ),
+            OutputParam(
+                "negative_text_rope_pos",
+                type_hint=torch.Tensor,
+                description="RoPE positions of the negative prompt tokens.",
+            ),
+        ]
+
+    @staticmethod
+    def check_inputs(negative_prompt_embeds: torch.Tensor | None, negative_pooled_prompt_embeds: torch.Tensor | None):
+        if (negative_prompt_embeds is None) != (negative_pooled_prompt_embeds is None):
+            raise ValueError("`negative_prompt_embeds` and `negative_pooled_prompt_embeds` must be passed together.")
+
+    @torch.no_grad()
+    def __call__(self, components: KandinskyS2VModularPipeline, state: PipelineState) -> PipelineState:
+        block_state = self.get_block_state(state)
+        self.check_inputs(block_state.negative_prompt_embeds, block_state.negative_pooled_prompt_embeds)
+        dtype = components.transformer.dtype
+
+        block_state.negative_text_rope_pos = None
+        if block_state.negative_prompt_embeds is not None:
+            block_state.negative_prompt_embeds = block_state.negative_prompt_embeds.to(dtype)
+            block_state.negative_pooled_prompt_embeds = block_state.negative_pooled_prompt_embeds.to(dtype)
+            block_state.negative_text_rope_pos = torch.arange(
+                block_state.negative_prompt_embeds.shape[0], device=components._execution_device
+            )
 
         self.set_block_state(state, block_state)
         return components, state

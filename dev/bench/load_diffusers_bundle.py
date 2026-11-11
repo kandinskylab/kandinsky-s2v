@@ -19,6 +19,8 @@ import json
 import time
 from pathlib import Path
 
+import librosa
+import PIL.Image
 import torch
 
 from kandinsky_s2v.ports.diffusers import modular, scheduling_piflow, transformer_kandinsky_s2v
@@ -73,7 +75,13 @@ def main() -> None:
         return
 
     started = time.time()
-    inputs = {"image": args.image, "audio": args.audio, "num_chunks": args.chunks, "output_type": "np"}
+    # The pipeline takes no files.
+    inputs = {
+        "image": PIL.Image.open(args.image),
+        "audio": librosa.load(args.audio, sr=16000)[0],
+        "num_chunks": args.chunks,
+        "output_type": "np",
+    }
     if args.steps is not None:
         inputs["num_inference_steps"] = args.steps
     frames = pipe(**inputs, output="videos")[0]

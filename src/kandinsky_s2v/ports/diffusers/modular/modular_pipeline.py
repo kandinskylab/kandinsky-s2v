@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import tempfile
-from pathlib import Path
-
 import numpy as np
 import PIL.Image
 import torch
@@ -62,43 +58,19 @@ def align(size: int, multiple: int) -> int:
     return (size // multiple) * multiple
 
 
-def select_resolution(
-    image: PIL.Image.Image,
-    allowed: tuple[tuple[int, int], ...] = ((512, 512), (768, 512), (512, 768)),
-) -> tuple[int, int]:
+def select_resolution(image: PIL.Image.Image) -> tuple[int, int]:
     """Pick the ``(height, width)`` bucket closest in aspect ratio to the image."""
     aspect = image.width / image.height
-    return min(allowed, key=lambda res: abs(aspect - res[1] / res[0]))
+    return min(((512, 512), (768, 512), (512, 768)), key=lambda res: abs(aspect - res[1] / res[0]))
 
 
-def audio_duration(path: str | Path) -> float:
-    import soundfile as sf  # noqa: PLC0415
-
-    info = sf.info(str(path))
-    return info.frames / info.samplerate
-
-
-def pad_with_silence(path: str | Path, target_duration: float) -> Path | None:
-    """Append silence so the track covers ``target_duration``; ``None`` if it already does."""
-    import soundfile as sf  # noqa: PLC0415
-
-    original = audio_duration(path)
+def pad_waveform_with_silence(waveform: np.ndarray, target_duration: float) -> np.ndarray:
+    """Append silence so a waveform at `AUDIO_SAMPLE_RATE` covers ``target_duration``."""
+    original = waveform.shape[0] / AUDIO_SAMPLE_RATE
     if target_duration <= original + 0.01:
-        return None
-
-    data, sample_rate = sf.read(str(path))
-    pad_samples = int((target_duration - original) * sample_rate)
-    shape = (pad_samples,) if data.ndim == 1 else (pad_samples, data.shape[1])
-    padded = np.concatenate([data, np.zeros(shape, dtype=data.dtype)])
-
-    handle, temp_path = tempfile.mkstemp(suffix=".wav")
-    os.close(handle)
-    try:
-        sf.write(temp_path, padded, sample_rate)
-    except BaseException:
-        os.unlink(temp_path)
-        raise
-    return Path(temp_path)
+        return waveform
+    pad_samples = int((target_duration - original) * AUDIO_SAMPLE_RATE)
+    return np.concatenate([waveform, np.zeros(pad_samples, dtype=waveform.dtype)])
 
 
 def split_audio_embeds(audio_embeds: torch.Tensor, chunks: int) -> list[torch.Tensor]:
@@ -111,7 +83,7 @@ def split_audio_embeds(audio_embeds: torch.Tensor, chunks: int) -> list[torch.Te
 
 def audio_rope_pos(num_audio_tokens: int, duration: int, device: torch.device) -> torch.Tensor:
     """Audio token -> index of the latent frame it belongs to."""
-    lengths = audio_group_lengths(num_audio_tokens, duration, device)
+    lengths = torch.tensor(audio_group_lengths(num_audio_tokens, duration), device=device)
     return torch.arange(duration, device=device).repeat_interleave(lengths).to(torch.int32)
 
 
@@ -137,8 +109,8 @@ class KandinskyS2VDistilledModularPipeline(KandinskyS2VModularPipeline):
     """
     A ModularPipeline for the pi-Flow distilled Kandinsky S2V 1.0 checkpoints.
 
-    Guidance is distilled into the student, so the guider defaults to `guidance_scale=1.0` and a single forward pass
-    runs per segment.
+    Guidance is distilled into the student, so its blocks have no guider and no negative prompt, and a single forward
+    pass runs per segment.
 
     """
 

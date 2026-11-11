@@ -14,7 +14,7 @@ from kandinsky_s2v.core.algo.denoise_loop import ChunkContext, TextContext
 from kandinsky_s2v.core.algo.piflow_sampler import piflow_denoise_chunk
 from kandinsky_s2v.core.components.dit import DiffusionTransformer3DS2V
 from kandinsky_s2v.core.components.piflow_dit import PiFlowDiffusionTransformer3DS2V
-from kandinsky_s2v.ports.diffusers.scheduling_piflow import KandinskyS2VPiflowScheduler
+from kandinsky_s2v.ports.diffusers.scheduling_piflow import PiflowScheduler
 from kandinsky_s2v.ports.diffusers.transformer_kandinsky_s2v import KandinskyS2VTransformer3DModel
 
 CONFIG = {
@@ -114,7 +114,6 @@ def call_ported(model, inputs: dict, latents: torch.Tensor, timestep: torch.Tens
         text_rope_pos=inputs["text_rope_pos"],
         audio_rope_pos=inputs["audio_rope_pos"],
         scale_factor=(1.0, 1.0, 1.0),
-        duration=DURATION,
         return_dict=False,
     )[0].squeeze(0)
 
@@ -203,7 +202,7 @@ def test_piflow_scheduler_matches_native_sampler():
         eps=EPS,
     )
 
-    scheduler = KandinskyS2VPiflowScheduler(
+    scheduler = PiflowScheduler(
         shift=SHIFT,
         n_grid=N_GRID,
         eps=EPS,

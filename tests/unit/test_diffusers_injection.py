@@ -97,10 +97,10 @@ def test_injection_places_the_port(injected: Path):
         assert "from ...pipelines" not in module.read_text(), module.name
     assert '"KandinskyS2VModularPipeline"' in (package / "modular_pipelines/kandinsky_s2v/__init__.py").read_text()
 
-    # The distilled bundles' scheduler ships with the port, so they need no other branch.
-    scheduler = (package / "schedulers/scheduling_kandinsky_s2v_piflow.py").read_text()
-    assert "class KandinskyS2VPiflowScheduler(FlowMatchEulerDiscreteScheduler):" in scheduler
-    assert "from .scheduling_flow_match_euler_discrete import" in scheduler
+    # The distilled bundles use the library's PiflowScheduler; the port's copy replaces it.
+    scheduler = (package / "schedulers/scheduling_piflow.py").read_text()
+    assert "class PiflowScheduler(SchedulerMixin, ConfigMixin):" in scheduler
+    assert "from .scheduling_utils import" in scheduler
 
 
 def test_injection_is_idempotent(injected: Path):

@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import time
 
+import librosa
 import numpy as np
+import PIL.Image
 import torch
 from diffusers import ClassifierFreeGuidance, ComponentsManager, FlowMatchEulerDiscreteScheduler
 from s2v_parity_pipeline import FixedReferenceLatent
@@ -34,7 +36,7 @@ from kandinsky_s2v.ports.diffusers.modular import (
     KandinskyS2VDistilledModularPipeline,
     KandinskyS2VModularPipeline,
 )
-from kandinsky_s2v.ports.diffusers.scheduling_piflow import KandinskyS2VPiflowScheduler
+from kandinsky_s2v.ports.diffusers.scheduling_piflow import PiflowScheduler
 from kandinsky_s2v.ports.diffusers.transformer_kandinsky_s2v import KandinskyS2VTransformer3DModel
 
 TOLERANCE = 2e-2
@@ -44,7 +46,7 @@ def build_scheduler(cfg):
     """The distilled configs need the pi-Flow policy sampler; the base ones do not."""
     if not cfg.piflow.enabled:
         return FlowMatchEulerDiscreteScheduler(shift=cfg.generation.scheduler_scale)
-    return KandinskyS2VPiflowScheduler(
+    return PiflowScheduler(
         shift=cfg.piflow.shift if cfg.piflow.shift is not None else cfg.generation.scheduler_scale,
         n_grid=cfg.piflow.n_grid,
         eps=cfg.piflow.eps,
@@ -145,7 +147,8 @@ def main() -> None:  # noqa: PLR0915
         tokenizer_2=native.embedder.clip_tokenizer,
         scheduler=build_scheduler(cfg),
         # Guidance is a component here, not an argument; the config's weight on both sides.
-        guider=ClassifierFreeGuidance(guidance_scale=gen_cfg.guidance_weight),
+        # Guidance is a component of the base blocks only; the distilled ones have none.
+        **({} if distilled else {"guider": ClassifierFreeGuidance(guidance_scale=gen_cfg.guidance_weight)}),
     )
     if manager is not None:
         # The config asks for module offload, and Pro does not fit otherwise: the
@@ -160,10 +163,11 @@ def main() -> None:  # noqa: PLR0915
     generator = torch.Generator(device=device).manual_seed(gen_cfg.seed)
     with pinned:
         ported_frames = ported(
-            image=args.image,
-            audio=args.audio,
+            # The pipeline takes no files; loaded as its documentation does.
+            image=PIL.Image.open(args.image),
+            audio=librosa.load(args.audio, sr=16000)[0],
             prompt=gen_cfg.prompt,
-            negative_prompt=gen_cfg.negative_prompt,
+            **({} if distilled else {"negative_prompt": gen_cfg.negative_prompt}),
             num_latent_frames=gen_cfg.latent_frames,
             fps=gen_cfg.fps,
             num_chunks=args.chunks,

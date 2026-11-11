@@ -27,7 +27,7 @@ from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
-from ..scheduling_piflow import KandinskyS2VPiflowScheduler
+from ..scheduling_piflow import PiflowScheduler
 from ..transformer_kandinsky_s2v import KandinskyS2VTransformer3DModel
 from .before_denoise import memory_rope_pos, roll_memory
 from .modular_pipeline import KandinskyS2VModularPipeline, align, audio_rope_pos
@@ -96,14 +96,15 @@ class KandinskyS2VChunkSchedulerResetStep(ModularPipelineBlocks):
     def __call__(
         self, components: KandinskyS2VModularPipeline, block_state: BlockState, k: int
     ) -> tuple[KandinskyS2VModularPipeline, BlockState]:
-        device = components._execution_device
-        if getattr(components.scheduler, "is_piflow", False):
-            components.scheduler.set_timesteps(block_state.num_inference_steps, device=device)
-        else:
-            # torch.linspace in float32, not numpy in float64: a one-ULP difference in the step size moves the
-            # trajectory, which then diverges on its own.
-            grid = torch.linspace(1.0, 0.0, block_state.num_inference_steps, dtype=torch.float32)[:-1]
-            components.scheduler.set_timesteps(sigmas=grid.numpy(), device=device)
+        if block_state.num_inference_steps < 2:
+            raise ValueError(
+                f"`num_inference_steps` must be at least 2, got {block_state.num_inference_steps}: "
+                "the schedule runs `num_inference_steps - 1` Euler updates."
+            )
+        # torch.linspace in float32, not numpy in float64: a one-ULP difference in the step size moves the
+        # trajectory, which then diverges on its own.
+        grid = torch.linspace(1.0, 0.0, block_state.num_inference_steps, dtype=torch.float32)[:-1]
+        components.scheduler.set_timesteps(sigmas=grid.numpy(), device=components._execution_device)
         block_state.timesteps = components.scheduler.timesteps
         return components, block_state
 
@@ -117,11 +118,43 @@ class KandinskyS2VDistilledChunkSchedulerResetStep(KandinskyS2VChunkSchedulerRes
 
     @property
     def expected_components(self) -> list[ComponentSpec]:
-        return [ComponentSpec("scheduler", KandinskyS2VPiflowScheduler)]
+        return [ComponentSpec("scheduler", PiflowScheduler)]
 
     @property
     def inputs(self) -> list[InputParam]:
         return [InputParam.template("num_inference_steps", default=16)]
+
+    @torch.no_grad()
+    def __call__(
+        self, components: KandinskyS2VModularPipeline, block_state: BlockState, k: int
+    ) -> tuple[KandinskyS2VModularPipeline, BlockState]:
+        components.scheduler.set_timesteps(block_state.num_inference_steps, device=components._execution_device)
+        block_state.timesteps = components.scheduler.timesteps
+        return components, block_state
+
+
+def shared_transformer_kwargs(
+    transformer: KandinskyS2VTransformer3DModel,
+    reference_hidden_states: torch.Tensor,
+    memory: list[torch.Tensor],
+    visual_rope_pos: list[torch.Tensor],
+    reference_rope_pos: list[torch.Tensor],
+    num_audio_tokens: int,
+    num_latent_frames: int,
+    scale_factor: tuple[float, float, float],
+    device: torch.device,
+) -> dict:
+    """The transformer inputs of a chunk that are the same in every pass."""
+    return {
+        "reference_hidden_states": reference_hidden_states.unsqueeze(0),
+        "memory_hidden_states": tuple(m.unsqueeze(0).to(transformer.dtype) for m in reversed(memory)),
+        "visual_rope_pos": visual_rope_pos,
+        "reference_rope_pos": reference_rope_pos,
+        "memory_rope_pos": tuple(reversed(memory_rope_pos(transformer.config, memory, device))),
+        "audio_rope_pos": audio_rope_pos(num_audio_tokens, num_latent_frames, device),
+        "scale_factor": scale_factor,
+        "return_dict": False,
+    }
 
 
 class KandinskyS2VChunkDenoiseInner(ModularPipelineBlocks):
@@ -175,19 +208,9 @@ class KandinskyS2VChunkDenoiseInner(ModularPipelineBlocks):
     def __call__(
         self, components: KandinskyS2VModularPipeline, block_state: BlockState, k: int
     ) -> tuple[KandinskyS2VModularPipeline, BlockState]:
-        if getattr(components.scheduler, "is_piflow", False) and components.requires_unconditional_embeds:
-            # Guidance on top of a distilled student over-guides it and doubles the cost.
-            raise ValueError(
-                f"guidance must be off with {type(components.scheduler).__name__}: CFG is distilled into the student"
-            )
-
-        config = components.transformer.config
         transformer_dtype = components.transformer.dtype
-        device = components._execution_device
         latents = block_state.latents
         chunk_audio = block_state.chunk_audio
-        num_latent_frames = block_state.num_latent_frames
-        memory = block_state.memory
 
         # Only these differ between the conditional and the unconditional pass.
         negative_embeds = block_state.negative_prompt_embeds
@@ -201,17 +224,17 @@ class KandinskyS2VChunkDenoiseInner(ModularPipelineBlocks):
             "text_rope_pos": (block_state.text_rope_pos, block_state.negative_text_rope_pos),
         }
         # Tuples here are not (cond, uncond) pairs, so they stay out of the guider's inputs.
-        shared_kwargs = {
-            "reference_hidden_states": block_state.reference_hidden_states.unsqueeze(0),
-            "memory_hidden_states": tuple(m.unsqueeze(0).to(transformer_dtype) for m in reversed(memory)),
-            "visual_rope_pos": block_state.visual_rope_pos,
-            "reference_rope_pos": block_state.reference_rope_pos,
-            "memory_rope_pos": tuple(reversed(memory_rope_pos(config, memory, device))),
-            "audio_rope_pos": audio_rope_pos(chunk_audio.shape[0], num_latent_frames, device),
-            "scale_factor": block_state.scale_factor,
-            "duration": num_latent_frames,
-            "return_dict": False,
-        }
+        shared_kwargs = shared_transformer_kwargs(
+            transformer=components.transformer,
+            reference_hidden_states=block_state.reference_hidden_states,
+            memory=block_state.memory,
+            visual_rope_pos=block_state.visual_rope_pos,
+            reference_rope_pos=block_state.reference_rope_pos,
+            num_audio_tokens=block_state.chunk_audio.shape[0],
+            num_latent_frames=block_state.num_latent_frames,
+            scale_factor=block_state.scale_factor,
+            device=components._execution_device,
+        )
 
         timesteps = block_state.timesteps
         for i, t in enumerate(tqdm(timesteps, desc=f"chunk {k + 1}", leave=False)):
@@ -245,16 +268,17 @@ class KandinskyS2VDistilledChunkDenoiseInner(KandinskyS2VChunkDenoiseInner):
     model_name = "kandinsky-s2v-distilled"
 
     @property
+    def description(self) -> str:
+        return (
+            "Inner denoising loop over the segments of one chunk for the distilled checkpoints: one conditional pass "
+            "per segment, since classifier-free guidance is distilled into the student."
+        )
+
+    @property
     def expected_components(self) -> list[ComponentSpec]:
         return [
             ComponentSpec("transformer", KandinskyS2VTransformer3DModel),
-            ComponentSpec("scheduler", KandinskyS2VPiflowScheduler),
-            ComponentSpec(
-                "guider",
-                ClassifierFreeGuidance,
-                config=FrozenDict({"guidance_scale": 1.0}),
-                default_creation_method="from_config",
-            ),
+            ComponentSpec("scheduler", PiflowScheduler),
         ]
 
     @property
@@ -262,7 +286,43 @@ class KandinskyS2VDistilledChunkDenoiseInner(KandinskyS2VChunkDenoiseInner):
         return [
             param if param.name != "num_inference_steps" else InputParam.template("num_inference_steps", default=16)
             for param in super().inputs
+            if not param.name.startswith("negative_")
         ]
+
+    @torch.no_grad()
+    def __call__(
+        self, components: KandinskyS2VModularPipeline, block_state: BlockState, k: int
+    ) -> tuple[KandinskyS2VModularPipeline, BlockState]:
+        transformer_dtype = components.transformer.dtype
+        latents = block_state.latents
+        shared_kwargs = shared_transformer_kwargs(
+            transformer=components.transformer,
+            reference_hidden_states=block_state.reference_hidden_states,
+            memory=block_state.memory,
+            visual_rope_pos=block_state.visual_rope_pos,
+            reference_rope_pos=block_state.reference_rope_pos,
+            num_audio_tokens=block_state.chunk_audio.shape[0],
+            num_latent_frames=block_state.num_latent_frames,
+            scale_factor=block_state.scale_factor,
+            device=components._execution_device,
+        )
+
+        timesteps = block_state.timesteps
+        for t in tqdm(timesteps, desc=f"chunk {k + 1}", leave=False):
+            noise_pred = components.transformer(
+                hidden_states=latents.unsqueeze(0).to(transformer_dtype),
+                timestep=t.expand(1).to(latents.dtype),
+                encoder_hidden_states=block_state.prompt_embeds.unsqueeze(0),
+                audio_hidden_states=block_state.chunk_audio.unsqueeze(0),
+                pooled_projections=block_state.pooled_prompt_embeds,
+                text_rope_pos=block_state.text_rope_pos,
+                **shared_kwargs,
+            )[0]
+            # float() keeps the scheduler from handing the latents back in bf16
+            latents = components.scheduler.step(noise_pred.squeeze(0).float(), t, latents, return_dict=False)[0]
+
+        block_state.latents = latents
+        return components, block_state
 
 
 class KandinskyS2VChunkUpdateStep(ModularPipelineBlocks):
@@ -315,7 +375,14 @@ class KandinskyS2VChunkLoopWrapper(LoopSequentialPipelineBlocks):
 
     @property
     def loop_intermediate_outputs(self) -> list[OutputParam]:
-        return [OutputParam("latent_chunks", type_hint=list, description="Denoised latents of each chunk.")]
+        return [
+            OutputParam(
+                "latent_chunks",
+                type_hint=list,
+                description="Denoised latents of each chunk, each shaped "
+                "(num_latent_frames, latent_height, latent_width, channels).",
+            )
+        ]
 
     @torch.no_grad()
     def __call__(self, components: KandinskyS2VModularPipeline, state: PipelineState) -> PipelineState:

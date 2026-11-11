@@ -147,7 +147,6 @@ def main() -> None:
             text_rope_pos=inputs["text_pos"],
             audio_rope_pos=inputs["audio_pos"],
             scale_factor=inputs["scale_factor"],
-            duration=inputs["duration"],
             return_dict=False,
         )[0].squeeze(0)
     actual = actual.float().cpu()

@@ -11,13 +11,12 @@ Kandinsky S2V 1.0 is versioned apart from the other Kandinsky models, so it
 stands apart in the library as well rather than joining another family's files:
 
 * the transformer is `models/transformers/transformer_kandinsky_s2v.py`;
-* the pi-Flow scheduler of the distilled checkpoints is
-  `schedulers/scheduling_kandinsky_s2v_piflow.py`, so the distilled bundles do
-  not depend on another family's scheduler;
+* the distilled checkpoints use the library's `PiflowScheduler`; the port's copy
+  of it carries the final-step fix, so it replaces `schedulers/scheduling_piflow.py`;
 * the pipeline is modular only, as Diffusers prefers for new models: blocks for the
   base and the distilled checkpoints and their `ModularPipeline` classes, in the
   package `modular_pipelines/kandinsky_s2v/`;
-* the documentation is three pages of its own, added to the toctree;
+* the documentation is two pages of its own, added to the toctree;
 * the tests are Diffusers' own, kept in `dev/diffusers_tests/` under the paths
   they take in the repository's `tests/`, and copied there as they are.
 
@@ -50,7 +49,7 @@ PORT = Path(__file__).resolve().parents[2] / "src/kandinsky_s2v/ports/diffusers"
 TESTS = Path(__file__).resolve().parents[1] / "diffusers_tests"
 
 TRANSFORMER = "KandinskyS2VTransformer3DModel"
-SCHEDULER = "KandinskyS2VPiflowScheduler"
+SCHEDULER = "PiflowScheduler"
 MODULAR_PACKAGE = "modular_pipelines/kandinsky_s2v"
 MODULAR_BLOCKS = "KandinskyS2VAutoBlocks"
 MODULAR_DISTILLED_BLOCKS = "KandinskyS2VDistilledAutoBlocks"
@@ -78,7 +77,7 @@ MODULAR_REWRITES = (
     ("from diffusers.utils import", "from ...utils import"),
     ("from diffusers.utils.torch_utils import", "from ...utils.torch_utils import"),
     ("from diffusers.video_processor import", "from ...video_processor import"),
-    ("from ..scheduling_piflow import", "from ...schedulers.scheduling_kandinsky_s2v_piflow import"),
+    ("from ..scheduling_piflow import", "from ...schedulers import"),
     ("from ..transformer_kandinsky_s2v import", "from ...models.transformers.transformer_kandinsky_s2v import"),
 )
 
@@ -102,13 +101,11 @@ SOURCES = (
     ),
     (
         "scheduling_piflow.py",
-        "schedulers/scheduling_kandinsky_s2v_piflow.py",
+        "schedulers/scheduling_piflow.py",
         (
             ("from diffusers.configuration_utils import", "from ..configuration_utils import"),
-            (
-                "from diffusers.schedulers.scheduling_flow_match_euler_discrete import",
-                "from .scheduling_flow_match_euler_discrete import",
-            ),
+            ("from diffusers.utils import", "from ..utils import"),
+            ("from diffusers.schedulers.scheduling_utils import", "from .scheduling_utils import"),
         ),
     ),
     *((f"modular/{name}", f"{MODULAR_PACKAGE}/{name}", MODULAR_REWRITES) for name in MODULAR_FILES),
@@ -172,7 +169,6 @@ else:
 # ours are registered right after in the root __init__.
 DUMMIES = (
     ("utils/dummy_pt_objects.py", "Kandinsky6Transformer3DModel", (TRANSFORMER,), ("torch",)),
-    ("utils/dummy_pt_objects.py", "IPNDMScheduler", (SCHEDULER,), ("torch",)),
     (
         "utils/dummy_torch_and_transformers_objects.py",
         "Ideogram4ModularPipeline",
@@ -201,25 +197,11 @@ def dummy_class(name: str, backends: tuple[str, ...]) -> str:
 
 
 # Registrations, anchored on lines already in these tables: the Kandinsky 6
-# entries the transformer sorts after, and for the scheduler the one it sorts after.
+# entries the transformer sorts after. The scheduler is registered already.
 # (file, anchor, line, placed "after" or "before" the anchor)
 REGISTRATIONS = (
     ("__init__.py", '            "Kandinsky6Transformer3DModel",', f'            "{TRANSFORMER}",', "after"),
     ("__init__.py", "            Kandinsky6Transformer3DModel,", f"            {TRANSFORMER},", "after"),
-    ("__init__.py", '            "IPNDMScheduler",', f'            "{SCHEDULER}",', "after"),
-    ("__init__.py", "            IPNDMScheduler,", f"            {SCHEDULER},", "after"),
-    (
-        "schedulers/__init__.py",
-        '    _import_structure["scheduling_ipndm"] = ["IPNDMScheduler"]',
-        f'    _import_structure["scheduling_kandinsky_s2v_piflow"] = ["{SCHEDULER}"]',
-        "after",
-    ),
-    (
-        "schedulers/__init__.py",
-        "        from .scheduling_k_dpm_2_discrete import KDPM2DiscreteScheduler",
-        f"        from .scheduling_kandinsky_s2v_piflow import {SCHEDULER}",
-        "after",
-    ),
     (
         "models/__init__.py",
         '    _import_structure["transformers.transformer_kandinsky6_sr"] = ["Kandinsky6SRTransformer3DModel"]',
@@ -318,6 +300,8 @@ only; there is no standard `DiffusionPipeline` class for it.
 | [Lite distilled][lite-distill] | 2B | [`{MODULAR_DISTILLED_BLOCKS}`] | [`{SCHEDULER}`] | 16 | off |
 | [Pro distilled][pro-distill] | 21B | [`{MODULAR_DISTILLED_BLOCKS}`] | [`{SCHEDULER}`] | 16 | off |
 
+The distilled checkpoints configure `{SCHEDULER}` with `shift=10.0` and `n_grid=5`, not its defaults.
+
 [lite]: https://huggingface.co/kandinskylab/Kandinsky-S2V-1.0-Lite-Diffusers
 [pro]: https://huggingface.co/kandinskylab/Kandinsky-S2V-1.0-Pro-Diffusers
 [lite-distill]: https://huggingface.co/kandinskylab/Kandinsky-S2V-1.0-Lite-distill-Diffusers
@@ -325,46 +309,75 @@ only; there is no standard `DiffusionPipeline` class for it.
 
 `ModularPipeline.from_pretrained` picks the blocks from the checkpoint. The steps
 default to the values above. Classifier-free guidance is the `guider` component,
-not a call argument: the base checkpoints ship it at 3.0, and the distilled ones
-at 1.0, because guidance is already part of the student — they reject any other.
+not a call argument: the base checkpoints ship it at 3.0. The distilled ones have
+no guider and no `negative_prompt`, because guidance is already part of the student.
 
 ## Usage
 
 ```py
+import librosa
 import torch
 from diffusers import ModularPipeline
-from diffusers.utils import export_to_video
+from diffusers.utils import encode_video, load_image
 
 pipe = ModularPipeline.from_pretrained("kandinskylab/Kandinsky-S2V-1.0-Lite-distill-Diffusers")
 pipe.load_components(dtype=torch.bfloat16)
 pipe.to("cuda")
 
-video = pipe(image="reference.png", audio="speech.wav", output="videos")[0]
-export_to_video(video, "avatar.mp4", fps=25)
+image = load_image("reference.png")
+audio, _ = librosa.load("speech.wav", sr=16000)  # a mono waveform at 16 kHz, for the model
+speech, sample_rate = librosa.load("speech.wav", sr=None)  # the original track, added to the output video
+
+video = pipe(image=image, audio=audio, output="videos")[0]
+encode_video(
+    video,
+    fps=25,
+    output_path="avatar.mp4",
+    audio=torch.from_numpy(speech)[None],
+    audio_sample_rate=sample_rate,
+)
 ```
 
-`export_to_video` writes the frames only; add the speech track with any muxer, for
-example `ffmpeg -i avatar.mp4 -i speech.wav -c:v copy -c:a aac -shortest out.mp4`.
-
 The Pro checkpoints do not fit an 80 GB GPU next to the 7B speech and text encoder
-when every component is on the device. Keep one model on the GPU at a time, which
-brings the peak to about 46 GiB:
+when every component is on the device. Offload them through a `ComponentsManager`:
 
 ```py
-from diffusers import ComponentsManager
+import librosa
+import torch
+from diffusers import ComponentsManager, ModularPipeline
+from diffusers.utils import encode_video, load_image
 
 manager = ComponentsManager()
 pipe = ModularPipeline.from_pretrained("kandinskylab/Kandinsky-S2V-1.0-Pro-Diffusers", components_manager=manager)
 pipe.load_components(dtype=torch.bfloat16)
-manager.enable_auto_cpu_offload(device="cuda", offload_strategy=lambda hooks, **_: hooks)
+manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin="40GiB")
+
+image = load_image("reference.png")
+audio, _ = librosa.load("speech.wav", sr=16000)
+speech, sample_rate = librosa.load("speech.wav", sr=None)
+
+video = pipe(image=image, audio=audio, output="videos")[0]
+encode_video(
+    video,
+    fps=25,
+    output_path="avatar.mp4",
+    audio=torch.from_numpy(speech)[None],
+    audio_sample_rate=sample_rate,
+)
 ```
 
-The default strategy is not enough here: it keeps the transformer beside the speech
-encoder because both fit, and the VAE decode that follows needs the room they hold.
-Enable the offload after `load_components`, so the strategy applies to every component.
+The margin is the memory kept free beyond the weights when a model is moved to the GPU.
+It has to hold the VAE decode of a chunk, about 33 GiB at 512x768: with the default 3 GB
+the transformer stays on the GPU through the decode, which then runs out of memory. With
+40 GiB the peak is about 50 GiB on an 80 GB GPU. Enable the offload after `load_components`,
+so it applies to every component.
 
 ## Notes
 
+- `image` is a PIL image and `audio` a mono float waveform in [-1, 1] at 16 kHz, as a tensor
+  or an array shaped `(samples,)`; the pipeline does not read files.
+- The top-level blocks (`text_encoder`, `vae_encoder`, `denoise`, `decode`) run on their own too;
+  pass the same `num_latent_frames` and `fps` to each when you run them separately.
 - The number of chunks follows the length of the speech track unless `num_chunks`
   is passed. The video is trimmed to the track either way, so chunks past its end
   are computed and dropped, with a warning.
@@ -386,17 +399,6 @@ Enable the offload after `load_components`, so the strategy applies to every com
 ## {MODULAR_DISTILLED_BLOCKS}
 
 [[autodoc]] {MODULAR_DISTILLED_BLOCKS}
-""",
-    f"{DOCS}/api/schedulers/kandinsky_s2v_piflow.md": f"""{DOC_LICENSE}
-# {SCHEDULER}
-
-`{SCHEDULER}` is the few-step pi-Flow scheduler of the distilled Kandinsky S2V 1.0
-checkpoints. The student predicts a grid of x0 values per segment in one forward
-pass, and the scheduler integrates that policy across the segment, so each
-segment costs a single model evaluation.
-
-## {SCHEDULER}
-[[autodoc]] {SCHEDULER}
 """,
     f"{DOCS}/api/models/kandinsky_s2v_transformer.md": f"""{DOC_LICENSE}
 # {TRANSFORMER}
@@ -424,11 +426,6 @@ DOC_REGISTRATIONS = (
         "      - local: api/pipelines/latte",
         "      - local: api/pipelines/kandinsky_s2v\n        title: Kandinsky S2V 1.0",
     ),
-    (
-        TOCTREE,
-        "    - local: api/schedulers/dpm_discrete_ancestral",
-        f"    - local: api/schedulers/kandinsky_s2v_piflow\n      title: {SCHEDULER}",
-    ),
 )
 
 
@@ -438,6 +435,9 @@ TEST_FILES = (
     "models/transformers/test_models_transformer_kandinsky_s2v.py",
     "modular_pipelines/kandinsky_s2v/test_modular_pipeline_kandinsky_s2v.py",
 )
+# Upstream's own test file, with the S2V pull request's test added: copied as it
+# is, since Diffusers does not restyle its tests' docstrings and neither may we.
+VERBATIM_TEST_FILES = ("schedulers/test_scheduler_piflow.py",)
 TEST_PACKAGE_INITS = ("modular_pipelines/kandinsky_s2v/__init__.py",)
 
 
@@ -447,6 +447,8 @@ def rendered_tests(root: Path) -> dict[Path, str]:
     for relative in TEST_FILES:
         target = root / "tests" / relative
         rendered[target] = reformat((TESTS / relative).read_text(), target)
+    for relative in VERBATIM_TEST_FILES:
+        rendered[root / "tests" / relative] = (TESTS / relative).read_text()
     return rendered
 
 
